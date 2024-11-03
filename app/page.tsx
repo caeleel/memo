@@ -1,101 +1,350 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Editor, EditorState, ContentState, RichUtils, convertToRaw, convertFromRaw, DraftModel, Modifier } from 'draft-js';
+import { v4 as uuidv4 } from 'uuid';
+import debounce from 'lodash.debounce';
+import 'draft-js/dist/Draft.css';
+import InlineToolbar from './components/InlineToolbar';
+import ToneDial from './components/ToneDial';
+import { OpenAI } from 'openai';
+
+interface Note {
+  id: string;
+  created: number;
+  contents: string; // Serialized Draft.js ContentState
+  title: string;
+}
+
+function useIsClient() {
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
+
+  return isMounted;
+}
+
+const NoteEditor: React.FC = () => {
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [currentNote, setCurrentNote] = useState<Note | null>(null);
+  const [editorState, setEditorState] = useState(() => EditorState.createEmpty());
+  const [toolbarPosition, setToolbarPosition] = useState<{ top: number; left: number } | null>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const isClient = useIsClient();
+
+  // Load notes on initial render
+  useEffect(() => {
+    const loadedNotes: Note[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith('note-')) {
+        const noteData = JSON.parse(localStorage.getItem(key) || '');
+        loadedNotes.push({
+          id: key.replace('note-', ''),
+          ...noteData
+        });
+      }
+    }
+
+    if (loadedNotes.length > 0) {
+      // Sort notes by creation date (newest first)
+      loadedNotes.sort((a, b) => b.created - a.created);
+      setNotes(loadedNotes);
+      selectNote(loadedNotes[0]);
+    } else {
+      createNewNote();
+    }
+  }, []);
+
+  const createNewNote = () => {
+    const id = uuidv4();
+    const newNote: Note = {
+      id,
+      created: Date.now(),
+      contents: JSON.stringify(convertToRaw(ContentState.createFromText(''))),
+      title: 'Untitled'
+    };
+
+    localStorage.setItem(`note-${id}`, JSON.stringify({
+      created: newNote.created,
+      contents: newNote.contents,
+      title: newNote.title
+    }));
+
+    setNotes(prev => [newNote, ...prev]);
+    selectNote(newNote);
+  };
+
+  const selectNote = (note: Note) => {
+    setCurrentNote(note);
+    const contentState = convertFromRaw(JSON.parse(note.contents));
+    setEditorState(EditorState.createWithContent(contentState));
+  };
+
+  const saveNote = useCallback(
+    debounce((noteId: string, editorContent: EditorState) => {
+      const contentState = editorContent.getCurrentContent();
+      const rawContent = convertToRaw(contentState);
+
+      // Extract title from first block
+      const blocks = rawContent.blocks;
+      const title = blocks.length > 0 ? blocks[0].text || 'Untitled' : 'Untitled';
+
+      // Update local storage
+      const noteData = {
+        created: currentNote?.created || Date.now(),
+        contents: JSON.stringify(rawContent),
+        title
+      };
+
+      localStorage.setItem(`note-${noteId}`, JSON.stringify(noteData));
+
+      // Update notes state
+      setNotes(prev => prev.map(note =>
+        note.id === noteId
+          ? { ...note, ...noteData }
+          : note
+      ));
+
+      setCurrentNote(prev => prev ? { ...prev, ...noteData } : null);
+    }, 1000),
+    [currentNote]
+  );
+
+  const handleEditorChange = (newEditorState: EditorState) => {
+    setEditorState(newEditorState);
+    if (currentNote) {
+      saveNote(currentNote.id, newEditorState);
+    }
+    updateToolbarPosition(newEditorState);
+  };
+
+  // Handle keyboard commands (e.g., Cmd+B for bold)
+  const handleKeyCommand = (command: string) => {
+    const newState = RichUtils.handleKeyCommand(editorState, command);
+    if (newState) {
+      handleEditorChange(newState);
+      return 'handled';
+    }
+    return 'not-handled';
+  };
+
+  // Auto-bold first line
+  const blockStyleFn = (contentBlock: DraftModel.ImmutableData.ContentBlock) => {
+    const type = contentBlock.getType();
+    if (contentBlock === editorState.getCurrentContent().getBlockMap().first()) {
+      return 'header-one';
+    }
+    return type;
+  };
+  const updateToolbarPosition = useCallback((currentEditorState: EditorState) => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      setToolbarPosition(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const selectionBounds = range.getBoundingClientRect();
+
+    if (selectionBounds.width < 0.1) {
+      setToolbarPosition(null);
+      return;
+    }
+
+    // Check if selection is in the first block (title)
+    const currentContent = currentEditorState.getCurrentContent();
+    const startKey = currentEditorState.getSelection().getStartKey();
+    const firstBlockKey = currentContent.getBlockMap().first().getKey();
+
+    // Don't show toolbar if selection is in title
+    if (startKey === firstBlockKey) {
+      setToolbarPosition(null);
+      return;
+    }
+
+    // Check if selection is too close to top of viewport
+    const TOOLBAR_HEIGHT = 40;
+    const MARGIN = 10;
+    const isCloseToTop = selectionBounds.top < (TOOLBAR_HEIGHT + MARGIN);
+
+    setToolbarPosition({
+      top: isCloseToTop
+        ? selectionBounds.bottom + 10 + TOOLBAR_HEIGHT
+        : selectionBounds.top - 10,
+      left: selectionBounds.left + (selectionBounds.width / 2),
+    });
+  }, []);
+
+  const toggleInlineStyle = (inlineStyle: string) => {
+    handleEditorChange(
+      RichUtils.toggleInlineStyle(editorState, inlineStyle)
+    );
+  };
+
+  // Create debounced tone select handler
+  const debouncedToneSelect = useCallback(
+    debounce(async (x: number, y: number, currentEditorState: EditorState) => {
+      // Get the selected text
+      const selection = currentEditorState.getSelection();
+      if (selection.isCollapsed()) return; // No text selected
+
+      const currentContent = currentEditorState.getCurrentContent();
+      const startKey = selection.getStartKey();
+      const startOffset = selection.getStartOffset();
+      const endKey = selection.getEndKey();
+      const endOffset = selection.getEndOffset();
+
+      let selectedText = '';
+
+      // Get selected text across blocks
+      const blockMap = currentContent.getBlockMap();
+      let inSelection = false;
+      blockMap.forEach((block) => {
+        if (!block) return;
+
+        if (block.getKey() === startKey) {
+          inSelection = true;
+          selectedText += block.getText().slice(startOffset);
+        } else if (block.getKey() === endKey) {
+          inSelection = false;
+          selectedText += block.getText().slice(0, endOffset);
+        } else if (inSelection) {
+          selectedText += block.getText();
+        }
+
+        if (inSelection && block.getKey() !== endKey) {
+          selectedText += '\n';
+        }
+      });
+
+      if (!selectedText) return;
+
+      const openai = new OpenAI({
+        apiKey: process.env.NEXT_PUBLIC_OPENAI_API_KEY,
+        dangerouslyAllowBrowser: true
+      });
+
+      // Normalize coordinates to -1 to 1 range
+      const normalizedX = (x - 50) / 50;
+      const normalizedY = (y - 50) / 50;
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: [
+            {
+              role: "system",
+              content: `You are a tone adjustment expert. Rewrite the given text to match the tone indicated by these coordinates: x=${normalizedX}, y=${normalizedY}. 
+              Where: 
+              - Top (y=-1) is Gen Z style (informal, internet slang, emojis)
+              - Right (x=1) is Millennial style (casual, friendly, some emojis)
+              - Bottom (y=1) is Gen X style (straightforward, slightly cynical)
+              - Left (x=-1) is Boomer style (formal, traditional)`
+            },
+            {
+              role: "user",
+              content: `Please rewrite this text: "${selectedText}"`
+            }
+          ]
+        });
+
+        const newText = completion.choices[0].message.content;
+        if (newText) {
+          // Replace the text
+          const newContentState = Modifier.replaceText(
+            currentEditorState.getCurrentContent(),
+            selection,
+            newText
+          );
+
+          // Create a new selection for the replaced text
+          const newSelection = selection.merge({
+            anchorOffset: selection.getStartOffset(),
+            focusOffset: selection.getStartOffset() + newText.length
+          });
+
+          // Push the new content and apply the selection
+          let newEditorState = EditorState.push(
+            currentEditorState,
+            newContentState,
+            'insert-characters'
+          );
+
+          // Force the selection of the new text
+          newEditorState = EditorState.forceSelection(newEditorState, newSelection);
+
+          handleEditorChange(newEditorState);
+        }
+      } catch (error) {
+        console.error('Error adjusting tone:', error);
+      }
+    }, 1000),
+    [handleEditorChange]
+  );
+
+  // Update handleToneSelect to use the debounced version
+  const handleToneSelect = (x: number, y: number) => {
+    debouncedToneSelect(x, y, editorState);
+  };
+
+  if (!isClient) return null;
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
-
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="flex h-screen bg-white">
+      {/* Left panel - Notes list */}
+      <div className="w-64 border-r p-4 overflow-y-auto">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-lg font-bold">Notes</h2>
+          <button
+            onClick={createNewNote}
+            className="px-2 py-1 text-sm bg-black text-white rounded hover:bg-gray-800"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+            New
+          </button>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
+        <div className="space-y-2">
+          {notes.map(note => (
+            <div
+              key={note.id}
+              onClick={() => selectNote(note)}
+              className={`p-2 rounded cursor-pointer hover:bg-gray-100 ${currentNote?.id === note.id ? 'bg-gray-100' : ''
+                }`}
+            >
+              <div className="font-bold truncate">{note.title}</div>
+              <div className="text-xs text-gray-500">
+                {new Date(note.created).toLocaleDateString()} {new Date(note.created).toLocaleTimeString()}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Middle panel - Editor */}
+      <div className="flex-1 p-4 relative" ref={editorRef}>
+        <InlineToolbar
+          editorState={editorState}
+          onToggle={toggleInlineStyle}
+          position={toolbarPosition}
+        />
+        <div className="prose max-w-none">
+          <Editor
+            editorState={editorState}
+            onChange={handleEditorChange}
+            handleKeyCommand={handleKeyCommand}
+            blockStyleFn={blockStyleFn}
           />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        </div>
+      </div>
+
+      {/* Right panel - Tone Dial */}
+      <div className="w-[18rem] border-l p-4 flex flex-col items-center">
+        <ToneDial onToneSelect={handleToneSelect} />
+      </div>
     </div>
   );
-}
+};
+
+export default NoteEditor;
