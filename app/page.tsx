@@ -185,102 +185,100 @@ const NoteEditor: React.FC = () => {
     );
   };
 
-  // Create debounced tone select handler
-  const debouncedToneSelect = useCallback(
-    debounce(async (x: number, y: number, labels: { top: string; right: string; bottom: string; left: string }, currentEditorState: EditorState) => {
-      // Get the selected text
-      const selection = currentEditorState.getSelection();
-      if (selection.isCollapsed()) return; // No text selected
+  // Remove the debouncedToneSelect and replace with a direct toneSelect function
+  const toneSelect = async (x: number, y: number, labels: { top: string; right: string; bottom: string; left: string }, currentEditorState: EditorState) => {
+    const selection = currentEditorState.getSelection();
+    if (selection.isCollapsed()) return; // No text selected
 
-      const currentContent = currentEditorState.getCurrentContent();
-      const startKey = selection.getStartKey();
-      const startOffset = selection.getStartOffset();
-      const endKey = selection.getEndKey();
-      const endOffset = selection.getEndOffset();
+    const currentContent = currentEditorState.getCurrentContent();
+    const startKey = selection.getStartKey();
+    const startOffset = selection.getStartOffset();
+    const endKey = selection.getEndKey();
+    const endOffset = selection.getEndOffset();
 
-      let selectedText = '';
+    let selectedText = '';
 
-      // Get selected text across blocks
-      const blockMap = currentContent.getBlockMap();
-      let inSelection = false;
-      blockMap.forEach((block) => {
-        if (!block) return;
+    // Get selected text across blocks
+    const blockMap = currentContent.getBlockMap();
+    let inSelection = false;
+    blockMap.forEach((block) => {
+      if (!block) return;
 
-        if (block.getKey() === startKey) {
-          inSelection = true;
-          selectedText += block.getText().slice(startOffset);
-        } else if (block.getKey() === endKey) {
-          inSelection = false;
-          selectedText += block.getText().slice(0, endOffset);
-        } else if (inSelection) {
-          selectedText += block.getText();
-        }
+      if (block.getKey() === startKey) {
+        inSelection = true;
+        selectedText += block.getText().slice(startOffset);
+      } else if (block.getKey() === endKey) {
+        inSelection = false;
+        selectedText += block.getText().slice(0, endOffset);
+      } else if (inSelection) {
+        selectedText += block.getText();
+      }
 
-        if (inSelection && block.getKey() !== endKey) {
-          selectedText += '\n';
-        }
+      if (inSelection && block.getKey() !== endKey) {
+        selectedText += '\n';
+      }
+    });
+
+    if (!selectedText) return;
+
+    try {
+      const response = await fetch('/api/tone', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: selectedText,
+          coordinates: {
+            x: (x - 50) / 50, // Normalize to -1 to 1
+            y: (y - 50) / 50,
+          },
+          tones: labels
+        })
       });
 
-      if (!selectedText) return;
+      if (!response.ok) {
+        throw new Error('Failed to adjust tone');
+      }
 
-      try {
-        const response = await fetch('/api/tone', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            text: selectedText,
-            coordinates: {
-              x: (x - 50) / 50, // Normalize to -1 to 1
-              y: (y - 50) / 50,
-            },
-            tones: labels
-          })
+      const { text: newText } = await response.json();
+
+      if (newText) {
+        // Replace the text
+        const newContentState = Modifier.replaceText(
+          currentEditorState.getCurrentContent(),
+          selection,
+          newText
+        );
+
+        // Create a new selection for the replaced text
+        const newSelection = selection.merge({
+          anchorOffset: selection.getStartOffset(),
+          focusOffset: selection.getStartOffset() + newText.length,
+          isBackward: false,
         });
 
-        if (!response.ok) {
-          throw new Error('Failed to adjust tone');
-        }
+        // Push the new content and apply the selection
+        let newEditorState = EditorState.push(
+          currentEditorState,
+          newContentState,
+          'insert-characters'
+        );
 
-        const { text: newText } = await response.json();
+        // Force the selection of the new text
+        newEditorState = EditorState.forceSelection(newEditorState, newSelection);
 
-        if (newText) {
-          // Replace the text
-          const newContentState = Modifier.replaceText(
-            currentEditorState.getCurrentContent(),
-            selection,
-            newText
-          );
-
-          // Create a new selection for the replaced text
-          const newSelection = selection.merge({
-            anchorOffset: selection.getStartOffset(),
-            focusOffset: selection.getStartOffset() + newText.length
-          });
-
-          // Push the new content and apply the selection
-          let newEditorState = EditorState.push(
-            currentEditorState,
-            newContentState,
-            'insert-characters'
-          );
-
-          // Force the selection of the new text
-          newEditorState = EditorState.forceSelection(newEditorState, newSelection);
-
-          handleEditorChange(newEditorState);
-        }
-      } catch (error) {
-        console.error('Error adjusting tone:', error);
+        handleEditorChange(newEditorState);
       }
-    }, 1000),
-    [handleEditorChange]
-  );
+    } catch (error) {
+      console.error('Error adjusting tone:', error);
+      throw error;
+    }
+  };
 
-  // Update handleToneSelect to use the debounced version
-  const handleToneSelect = (coordinates: { x: number; y: number }, labels: { top: string; right: string; bottom: string; left: string }) => {
-    debouncedToneSelect(coordinates.x, coordinates.y, labels, editorState);
+  // Update handleToneSelect to directly use toneSelect
+  const handleToneSelect = async (coordinates: { x: number; y: number }, labels: { top: string; right: string; bottom: string; left: string }) => {
+    await toneSelect(coordinates.x, coordinates.y, labels, editorState);
   };
 
   if (!isClient) return null;
