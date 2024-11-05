@@ -333,7 +333,7 @@ const NoteEditor: React.FC = () => {
       </div>
 
       {/* Right panel - Tone Dial */}
-      <div className="w-[18rem] border-l p-4 flex flex-col items-center">
+      <div className="w-[19rem] border-l p-4 flex flex-col items-center">
         <ToneDial id={MAIN_TONE_DIAL_ID} onToneSelect={handleToneSelect} />
       </div>
     </div>
