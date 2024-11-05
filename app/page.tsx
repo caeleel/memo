@@ -7,7 +7,6 @@ import debounce from 'lodash.debounce';
 import 'draft-js/dist/Draft.css';
 import InlineToolbar from './components/InlineToolbar';
 import ToneDial from './components/ToneDial';
-import { OpenAI } from 'openai';
 
 interface Note {
   id: string;
@@ -15,6 +14,8 @@ interface Note {
   contents: string; // Serialized Draft.js ContentState
   title: string;
 }
+
+const MAIN_TONE_DIAL_ID = 'tone-dial-01-main';
 
 function useIsClient() {
   const [isMounted, setIsMounted] = useState(false);
@@ -186,7 +187,7 @@ const NoteEditor: React.FC = () => {
 
   // Create debounced tone select handler
   const debouncedToneSelect = useCallback(
-    debounce(async (x: number, y: number, currentEditorState: EditorState) => {
+    debounce(async (x: number, y: number, labels: { top: string; right: string; bottom: string; left: string }, currentEditorState: EditorState) => {
       // Get the selected text
       const selection = currentEditorState.getSelection();
       if (selection.isCollapsed()) return; // No text selected
@@ -222,36 +223,28 @@ const NoteEditor: React.FC = () => {
 
       if (!selectedText) return;
 
-      const openai = new OpenAI({
-        apiKey: process.env.NEXT_PUBLIC_OPENAI_API_KEY,
-        dangerouslyAllowBrowser: true
-      });
-
-      // Normalize coordinates to -1 to 1 range
-      const normalizedX = (x - 50) / 50;
-      const normalizedY = (y - 50) / 50;
-
       try {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4",
-          messages: [
-            {
-              role: "system",
-              content: `You are a tone adjustment expert. Rewrite the given text to match the tone indicated by these coordinates: x=${normalizedX}, y=${normalizedY}. 
-              Where: 
-              - Top (y=-1) is Gen Z style (informal, internet slang, emojis)
-              - Right (x=1) is Millennial style (casual, friendly, some emojis)
-              - Bottom (y=1) is Gen X style (straightforward, slightly cynical)
-              - Left (x=-1) is Boomer style (formal, traditional)`
+        const response = await fetch('/api/tone', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: selectedText,
+            coordinates: {
+              x: (x - 50) / 50, // Normalize to -1 to 1
+              y: (y - 50) / 50,
             },
-            {
-              role: "user",
-              content: `Please rewrite this text: "${selectedText}"`
-            }
-          ]
+            tones: labels
+          })
         });
 
-        const newText = completion.choices[0].message.content;
+        if (!response.ok) {
+          throw new Error('Failed to adjust tone');
+        }
+
+        const { text: newText } = await response.json();
+
         if (newText) {
           // Replace the text
           const newContentState = Modifier.replaceText(
@@ -286,8 +279,8 @@ const NoteEditor: React.FC = () => {
   );
 
   // Update handleToneSelect to use the debounced version
-  const handleToneSelect = (x: number, y: number) => {
-    debouncedToneSelect(x, y, editorState);
+  const handleToneSelect = (coordinates: { x: number; y: number }, labels: { top: string; right: string; bottom: string; left: string }) => {
+    debouncedToneSelect(coordinates.x, coordinates.y, labels, editorState);
   };
 
   if (!isClient) return null;
@@ -341,7 +334,7 @@ const NoteEditor: React.FC = () => {
 
       {/* Right panel - Tone Dial */}
       <div className="w-[18rem] border-l p-4 flex flex-col items-center">
-        <ToneDial onToneSelect={handleToneSelect} />
+        <ToneDial id={MAIN_TONE_DIAL_ID} onToneSelect={handleToneSelect} />
       </div>
     </div>
   );
